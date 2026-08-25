@@ -38,13 +38,24 @@ pub(super) type RuleMap = BTreeMap<i64, Vec<SeccompRule>>;
 
 pub(super) fn build_errno_filter(
     syscalls: &NotificationSyscalls,
-    needs_network: bool,
+    network_restricted: bool,
+    allow_local_binding: bool,
     unix_sockets: UnixSocketFilter,
 ) -> Result<Option<BpfProgram>> {
     let mut errno_rules = RuleMap::new();
-    if needs_network {
-        add_socket_family_filter(&mut errno_rules, syscalls.socket)?;
+    if network_restricted {
+        add_socket_family_filter(&mut errno_rules, syscalls.socket, allow_local_binding)?;
         add_unix_socket_filters(&mut errno_rules, syscalls.socket, unix_sockets)?;
+        if allow_local_binding {
+            // Selective UDP mediation cannot inspect io_uring operations. Deny
+            // ring creation so IORING_OP_SOCKET and datagram sends cannot bypass
+            // the user-notification broker.
+            add_conditional_rule(
+                &mut errno_rules,
+                syscalls.io_uring_setup,
+                vec![seccomp_condition(0, SeccompCmpOp::MaskedEq(0), 0)?],
+            )?;
+        }
     }
     if errno_rules.is_empty() {
         return Ok(None);
@@ -56,10 +67,10 @@ pub(super) fn build_errno_filter(
 
 pub(super) fn network_filter(
     unix_sockets: UnixSocketFilter,
-    needs_network: bool,
+    network_restricted: bool,
 ) -> Result<NetworkFilters> {
     let syscalls = NotificationSyscalls::new();
-    let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
+    let errno = build_errno_filter(&syscalls, network_restricted, false, unix_sockets)?;
     Ok(NetworkFilters {
         errno,
         notify: None,
@@ -289,15 +300,21 @@ impl From<&UnixSocketAccess> for UnixSocketFilter {
     }
 }
 
-pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Result<()> {
+pub(super) fn add_socket_family_filter(
+    rules: &mut RuleMap,
+    socket: i64,
+    allow_udp: bool,
+) -> Result<()> {
     let stream = u64::try_from(libc::SOCK_STREAM).map_err(|_| LandstripError::IntegerTooLarge)?;
+    let dgram = u64::try_from(libc::SOCK_DGRAM).map_err(|_| LandstripError::IntegerTooLarge)?;
     let tcp = u64::try_from(libc::IPPROTO_TCP).map_err(|_| LandstripError::IntegerTooLarge)?;
+    let udp = u64::try_from(libc::IPPROTO_UDP).map_err(|_| LandstripError::IntegerTooLarge)?;
 
     for domain in [libc::AF_INET, libc::AF_INET6] {
         let domain = u64::try_from(domain).map_err(|_| LandstripError::IntegerTooLarge)?;
 
         for ty in 0..=SOCK_TYPE_MASK {
-            if ty == stream {
+            if ty == stream || (allow_udp && ty == dgram) {
                 continue;
             }
 
@@ -332,6 +349,29 @@ pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Resu
                 seccomp_condition(2, SeccompCmpOp::Gt, tcp)?,
             ],
         )?;
+
+        if allow_udp {
+            for proto in 1..udp {
+                add_conditional_rule(
+                    rules,
+                    socket,
+                    vec![
+                        seccomp_condition(0, SeccompCmpOp::Eq, domain)?,
+                        seccomp_condition(1, SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK), dgram)?,
+                        seccomp_condition(2, SeccompCmpOp::Eq, proto)?,
+                    ],
+                )?;
+            }
+            add_conditional_rule(
+                rules,
+                socket,
+                vec![
+                    seccomp_condition(0, SeccompCmpOp::Eq, domain)?,
+                    seccomp_condition(1, SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK), dgram)?,
+                    seccomp_condition(2, SeccompCmpOp::Gt, udp)?,
+                ],
+            )?;
+        }
     }
 
     for domain in [libc::AF_PACKET, libc::AF_NETLINK] {

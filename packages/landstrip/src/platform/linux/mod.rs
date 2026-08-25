@@ -68,6 +68,9 @@ pub(crate) fn execute(
     }
 
     let needs_fs_broker = filter::needs_filesystem_broker(policy) || trap_fd.is_some();
+    // Errno enforcement applies to every restricted network policy, even when
+    // none of its network operations require user-notification brokering.
+    let network_restricted = !network.is_unrestricted();
     let needs_network_broker = network.needs_network_broker();
     // allowNetwork / allowAllUnixSockets leave connect unmediated; still trap it so
     // systemd-run cannot start a process outside Landlock and seccomp.
@@ -79,7 +82,7 @@ pub(crate) fn execute(
             policy,
             tool,
             args,
-            needs_network_broker,
+            network_restricted,
             needs_fs_broker,
             trap_fd,
         )?;
@@ -88,8 +91,9 @@ pub(crate) fn execute(
 
     enforce_access_policy(policy)?;
 
-    if !network.is_unrestricted() {
-        let filters = filter::network_filter(network.unix_socket_access().into(), true)?;
+    if network_restricted {
+        let filters =
+            filter::network_filter(network.unix_socket_access().into(), network_restricted)?;
         filters.load()?;
     }
     close_inherited_fds(&[]).map_err(Error::supervise)?;

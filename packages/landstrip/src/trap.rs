@@ -202,10 +202,10 @@ impl Trap {
     pub(crate) fn network(
         operation: NetworkOperation,
         target: String,
+        syscall: &'static str,
         process: ProcessContext,
         query_id: Option<u64>,
     ) -> Self {
-        let syscall = operation.into();
         let (state, query_id) = TrapState::from_query_id(query_id);
         Self::Network(Box::new(NetworkTrap {
             code: Error::NetworkDenied.code(),

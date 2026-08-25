@@ -157,9 +157,9 @@ impl Error {
             Self::PolicyUnrestrictedRead => {
                 Some("unrestricted reads are unsupported by the active Windows sandbox")
             }
-            Self::PolicyTcpBindUnsupported => {
-                Some("local TCP binding is unsupported by the active Windows sandbox")
-            }
+            Self::PolicyTcpBindUnsupported => Some(
+                "selective local TCP and UDP binding is unsupported by the active Windows sandbox",
+            ),
             Self::PolicyUnixSocketUnsupported => {
                 Some("Unix socket policy is unsupported by the active Windows sandbox")
             }

@@ -68,13 +68,14 @@ name=default network denies TCP listener | os=linux,macos | policy={"filesystem"
 name=allowLocalBinding permits localhost listener | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-allowed
 name=allowNetwork permits localhost listener | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-allowed
 
-# --- unix domain sockets (macOS) ---
+# --- unix domain sockets ---
 
 name=allowUnixSockets permits exact socket path | os=macos | setup=mkdir:unix-sockets | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/allowed.sock"]}} | net=unix-allowed | unixsock=unix-sockets/allowed.sock
 name=allowUnixSockets rejects symlink path | os=macos | setup=mkdir:unix-sockets;symlink:allowed.sock:unix-sockets/socket-link | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/socket-link"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=allowUnixSockets rejects directory path | os=macos | setup=mkdir:unix-sockets | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=allowUnixSockets rejects regular file path | os=macos | setup=mkdir:unix-sockets;write:unix-sockets/not-a-socket: | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/not-a-socket"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=allowUnixSockets permits missing path | os=macos | setup=mkdir:unix-sockets | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/missing.sock"]}} | cmd=%SHELL% -c 'printf ok' | status=0
+name=allowAllUnixSockets permits pathname socket | os=linux | setup=mkdir:unix-sockets | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowAllUnixSockets":true}} | net=unix-allowed | unixsock=unix-sockets/allowed.sock
 name=denied unix connect reports EACCES not EAFNOSUPPORT | os=linux | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{}} | net=unix-denied
 name=systemd-run cannot bypass denyRead | os=linux | setup=mkdir:secret;write:secret/file:TOPSECRET92\n | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["%TMP%/secret"],"allowWrite":["%TMP%/allowed"]}} | cmd=%SHELL% -c 'command -v systemd-run >/dev/null || exit 0; out="$1/leaked"; rm -f "$out"; systemd-run --user --wait --collect sh -c "cat \"$2\" > \"$out\"" || true; if test -s "$out"; then printf leaked; exit 1; fi' _ %TMP%/allowed %TMP%/secret/file | status=0 | out!=leaked | out!=TOPSECRET92
 name=session bus connect denied under allowNetwork | os=linux | setup=write:allowed/probe.py:import errno,os,socket,sys\nr=os.environ.get("XDG_RUNTIME_DIR") or ("/run/user/%d"%os.getuid())\nfor p in (r+"/bus",r+"/systemd/private","/run/dbus/system_bus_socket"):\n    s=socket.socket(socket.AF_UNIX)\n    try:\n        s.connect(p)\n    except OSError as e:\n        if e.errno not in (errno.EACCES,errno.ENOENT,errno.ECONNREFUSED):\n            raise\n    else:\n        sys.exit("connected "+p)\n    finally:\n        s.close()\n | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["%TMP%/denied"],"allowWrite":["%TMP%/allowed"]}} | cmd=%SHELL% -c 'command -v python3 >/dev/null || exit 0; PYTHONDONTWRITEBYTECODE=1 python3 "$1"' _ %TMP%/allowed/probe.py | status=0
@@ -87,6 +88,23 @@ name=same-process thread signal still works | os=linux | policy={"network":{"all
 name=denied TCP connect is reported | os=linux | policy={"network":{"httpProxyPort":1},"filesystem":{"denyRead":["/home"],"allowRead":["/usr","/lib","/lib64","/bin","/sbin","/etc"]}} | net=connect-denied
 name=httpProxyPort permits its loopback port only | os=linux,macos | net=connect-allowed
 name=allowLocalBinding permits loopback TCP connect | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=loopback-allowed
+
+# --- UDP policy ---
+
+name=default network denies UDP loopback bind | os=linux,macos | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-bind-denied
+name=allowAllUnixSockets still denies UDP loopback bind | os=linux | policy={"network":{"allowAllUnixSockets":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-bind-denied
+name=allowLocalBinding permits IPv4 UDP request reply | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-loopback
+name=allowLocalBinding permits disconnecting and reconnecting a UDP socket | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-disconnect
+name=allowLocalBinding permits IPv6 UDP request reply | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-ipv6
+name=allowNetwork permits UDP request reply | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-unrestricted
+name=allowLocalBinding denies wildcard UDP bind | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-wildcard-denied
+name=allowLocalBinding denies non-loopback UDP bind | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-non-loopback-bind-denied
+name=allowLocalBinding denies non-loopback sendto | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-sendto-denied
+name=allowLocalBinding denies non-loopback sendmsg | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-sendmsg-denied
+name=allowLocalBinding validates sendmmsg batches before sending | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-sendmmsg-denied
+name=sendmmsg approvals are scoped to each target | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-sendmmsg-query
+name=sendmmsg stops after msg_len write fault | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=udp-sendmmsg-write-fault
+name=allowLocalBinding blocks io_uring bypass | os=linux | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=io-uring-denied
 
 # --- policy validation ---
 
@@ -192,5 +210,5 @@ name=allowWrite permits file rename (windows) | os=windows | setup=write:allowed
 name=denyWrite denies file deletion (windows) | os=windows | setup=write:allowed/sub/keep-me.txt:keep | policy={"filesystem":{"allowWrite":["%TMP%\\allowed"],"denyWrite":["%TMP%\\allowed\\sub"],"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C del /Q %TMP%\allowed\sub\keep-me.txt | status=!0
 name=denyWrite denies file rename (windows) | os=windows | setup=write:allowed/sub/keep-me.txt:keep | policy={"filesystem":{"allowWrite":["%TMP%\\allowed"],"denyWrite":["%TMP%\\allowed\\sub"],"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C move /Y %TMP%\allowed\sub\keep-me.txt %TMP%\allowed\moved.txt | status=!0
 name=unrestricted network policy permits tool | os=windows | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=0
-name=TCP local binding policy is rejected | os=windows | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=!0 | out=TCP_BIND_UNSUPPORTED
+name=selective local binding policy is rejected | os=windows | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=!0 | out=TCP_BIND_UNSUPPORTED
 name=proxy port policy runs with network blocked | os=windows | policy={"network":{"httpProxyPort":8080},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=0

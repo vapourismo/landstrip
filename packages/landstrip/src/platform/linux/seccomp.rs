@@ -3,10 +3,10 @@
 
 //! Seccomp filters and user-notification broker for network policy.
 //!
-//! Direct TCP is denied by default. Configured proxy ports and, when
-//! `allowLocalBinding` is enabled, arbitrary loopback ports are allowed. Local
-//! TCP bind also requires `allowLocalBinding`. Non-TCP INET, packet, and netlink
-//! sockets are blocked.
+//! Direct TCP and UDP are denied by default. Configured TCP proxy ports and,
+//! when `allowLocalBinding` is enabled, arbitrary TCP and UDP loopback ports are
+//! allowed. Local IP bind also requires `allowLocalBinding`. Other INET socket
+//! types and protocols, packet sockets, and netlink sockets are blocked.
 //!
 //! Unix sockets are denied by default. `allowUnixSockets` mediates pathname
 //! `connect` and `bind`; unnamed sockets and `socketpair` are not path-mediated.
@@ -31,7 +31,7 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, fcntl};
 use nix::poll::{PollFd, PollFlags, poll};
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
-use nix::sys::uio::{RemoteIoVec, process_vm_readv};
+use nix::sys::uio::{RemoteIoVec, process_vm_readv, process_vm_writev};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use serde::Deserialize;
@@ -41,7 +41,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -57,6 +57,10 @@ const USER_NOTIF_FLAG_CONTINUE: u32 = 1 << 0;
 // fchmodat2 (Linux 6.6+) is 452 on every landstrip target. libc only exports the
 // constant on some arches, so pin the number here for portable mediation.
 const SYS_FCHMODAT2: i64 = 452;
+const MAX_DATAGRAM_BYTES: usize = 65_535;
+const MAX_DATAGRAM_CONTROL_BYTES: usize = 65_535;
+const MAX_MESSAGE_IOVECS: usize = 1_024;
+const MAX_SENDMMSG_MESSAGES: usize = 1_024;
 
 nix::ioctl_readwrite!(
     seccomp_notif_recv,
@@ -138,14 +142,14 @@ pub(super) fn run_broker(
     policy: &AccessPolicy,
     tool: &OsStr,
     args: &[OsString],
-    needs_network: bool,
+    network_restricted: bool,
     needs_filesystem: bool,
     trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
-    let notify_bind = needs_network && policy.network_access.needs_bind_broker();
+    let notify_bind = network_restricted && policy.network_access.needs_bind_broker();
     // allowNetwork / allowAllUnixSockets leave unix unrestricted; still trap
     // connect so systemd-run cannot start a process outside Landlock/seccomp.
-    let notify_connect = (needs_network && policy.network_access.needs_network_broker())
+    let notify_connect = (network_restricted && policy.network_access.needs_network_broker())
         || needs_filesystem
         || matches!(
             policy.network_access.unix_socket_access(),
@@ -156,7 +160,13 @@ pub(super) fn run_broker(
     ensure_notification_supported()?;
 
     let syscalls = NotificationSyscalls::new();
-    let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
+    let allow_local_binding = policy.network_access.allows_local_binding();
+    let errno = build_errno_filter(
+        &syscalls,
+        network_restricted,
+        allow_local_binding,
+        unix_sockets,
+    )?;
 
     let mut notify_syscalls: Vec<i64> = Vec::new();
     if notify_bind {
@@ -164,6 +174,9 @@ pub(super) fn run_broker(
     }
     if notify_connect {
         notify_syscalls.push(syscalls.connect);
+    }
+    if network_restricted && allow_local_binding {
+        notify_syscalls.extend(syscalls.datagram_send_syscalls());
     }
     if notify_filesystem {
         notify_syscalls.extend(syscalls.filesystem_syscalls());
@@ -445,22 +458,22 @@ fn poll_broker_fds(
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Denial {
     Filesystem(FilesystemDenial),
-    Network(NetworkOperation, String, ProcessContext),
+    Network(NetworkOperation, String, &'static str, ProcessContext),
 }
 
 impl Denial {
     fn report_on_success(&self) -> bool {
         match self {
             Self::Filesystem(denial) => denial.operation == TrapOperation::Write,
-            Self::Network(_, _, _) => true,
+            Self::Network(_, _, _, _) => true,
         }
     }
 
     fn into_trap(self) -> Trap {
         match self {
             Self::Filesystem(denial) => Trap::filesystem(denial, None),
-            Self::Network(operation, target, process) => {
-                Trap::network(operation, target, process, None)
+            Self::Network(operation, target, syscall, process) => {
+                Trap::network(operation, target, syscall, process, None)
             }
         }
     }
@@ -578,6 +591,14 @@ fn handle_notification(
         )
     } else if syscall == ctx.syscalls.connect {
         handle_connect(
+            ctx.policy,
+            request,
+            denials,
+            ctx.query_enabled,
+            next_query_id,
+        )
+    } else if ctx.syscalls.is_datagram_send(syscall) {
+        handle_datagram_send(
             ctx.policy,
             request,
             denials,
@@ -734,21 +755,49 @@ fn process_context(pid: u32) -> ProcessContext {
 }
 
 // Defer a denied network operation to an interactive permission query. The
-// duplicated child socket fd is held in the grant so the broker can re-issue the
-// connect or bind itself once the launcher approves the query.
+// immutable grant holds a duplicated child socket plus copied operation data so
+// the broker can perform exactly the approved operation itself.
 fn network_query(
     operation: NetworkOperation,
     target: String,
+    syscall: &'static str,
     pid: u32,
-    socket: TargetSocket,
-    call: SocketAddrCall,
+    grant: SocketGrant,
     next_query_id: &mut u64,
 ) -> NotificationResult {
     let qid = *next_query_id;
     *next_query_id += 1;
-    let trap = Trap::network(operation, target, process_context(pid), Some(qid));
-    let grant = Grant::socket(socket.sock, socket.addr, call);
-    NotificationResult::query(qid, trap, Some(grant))
+    let trap = Trap::network(operation, target, syscall, process_context(pid), Some(qid));
+    NotificationResult::query(qid, trap, Some(Grant::Socket(grant)))
+}
+
+fn deny_network(
+    operation: NetworkOperation,
+    target: String,
+    syscall: &'static str,
+    pid: u32,
+    grant: SocketGrant,
+    denials: &mut Denials<'_>,
+    query_enabled: bool,
+    next_query_id: &mut u64,
+) -> SysResult<NotificationResult> {
+    if query_enabled {
+        return Ok(network_query(
+            operation,
+            target,
+            syscall,
+            pid,
+            grant,
+            next_query_id,
+        ));
+    }
+    denials.record(Denial::Network(
+        operation,
+        target,
+        syscall,
+        process_context(pid),
+    ));
+    Err(BrokerError::PolicyDenied)
 }
 
 fn handle_bind(
@@ -761,50 +810,27 @@ fn handle_bind(
     let socket = target_socket(request)?;
 
     match socket.info.kind() {
-        SocketKind::Tcp => {
-            if !policy.network_access.allows_local_tcp_bind() {
-                if let Ok(endpoint) = tcp_endpoint(&socket.addr, socket.info.domain) {
-                    if query_enabled {
-                        return Ok(network_query(
-                            NetworkOperation::Bind,
-                            endpoint.addr.to_string(),
-                            request.pid,
-                            socket,
-                            libc::bind,
-                            next_query_id,
-                        ));
-                    }
-                    denials.record(Denial::Network(
-                        NetworkOperation::Bind,
-                        endpoint.addr.to_string(),
-                        process_context(request.pid),
-                    ));
-                }
-                return Err(BrokerError::PolicyDenied);
-            }
-            let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
-            if !endpoint.loopback {
-                if query_enabled {
-                    return Ok(network_query(
-                        NetworkOperation::Bind,
-                        endpoint.addr.to_string(),
-                        request.pid,
-                        socket,
-                        libc::bind,
-                        next_query_id,
-                    ));
-                }
-                denials.record(Denial::Network(
+        SocketKind::Tcp | SocketKind::Udp => {
+            let endpoint = ip_endpoint(&socket.addr, socket.info.domain)?;
+            if !policy.network_access.allows_local_binding() || !endpoint.loopback {
+                let target = endpoint.addr.to_string();
+                let grant = SocketGrant::address(socket, libc::bind, None);
+                return deny_network(
                     NetworkOperation::Bind,
-                    endpoint.addr.to_string(),
-                    process_context(request.pid),
-                ));
-                return Err(BrokerError::PolicyDenied);
+                    target,
+                    "bind",
+                    request.pid,
+                    grant,
+                    denials,
+                    query_enabled,
+                    next_query_id,
+                );
             }
 
-            Ok(NotificationResult::Socket(SocketGrant::new(
+            Ok(NotificationResult::Socket(SocketGrant::address(
                 socket,
                 libc::bind,
+                None,
             )))
         }
         SocketKind::Unix => handle_unix_bind(policy, request.pid, socket),
@@ -827,35 +853,81 @@ fn handle_connect(
             if policy.network_access.is_unrestricted() {
                 return Ok(NotificationResult::Continue);
             }
-            let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
+            let endpoint = ip_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback
-                || (!policy.network_access.allows_local_tcp_bind()
+                || (!policy.network_access.allows_local_binding()
                     && !policy
                         .network_access
                         .connect_tcp_ports()
                         .contains(&endpoint.port))
             {
-                if query_enabled {
-                    return Ok(network_query(
-                        NetworkOperation::Connect,
-                        endpoint.addr.to_string(),
-                        request.pid,
-                        socket,
-                        libc::connect,
-                        next_query_id,
-                    ));
-                }
-                denials.record(Denial::Network(
+                let target = endpoint.addr.to_string();
+                let grant = SocketGrant::address(socket, libc::connect, None);
+                return deny_network(
                     NetworkOperation::Connect,
-                    endpoint.addr.to_string(),
-                    process_context(request.pid),
-                ));
-                return Err(BrokerError::PolicyDenied);
+                    target,
+                    "connect",
+                    request.pid,
+                    grant,
+                    denials,
+                    query_enabled,
+                    next_query_id,
+                );
             }
 
-            Ok(NotificationResult::Socket(SocketGrant::new(
+            Ok(NotificationResult::Socket(SocketGrant::address(
                 socket,
                 libc::connect,
+                None,
+            )))
+        }
+        SocketKind::Udp => {
+            if policy.network_access.is_unrestricted() {
+                return Ok(NotificationResult::Continue);
+            }
+            // AF_UNSPEC disconnects a UDP peer without authorizing a new
+            // destination. Execute it with the immutable copied sockaddr.
+            if sockaddr_family(&socket.addr)? == libc::AF_UNSPEC {
+                return Ok(NotificationResult::Socket(SocketGrant::address(
+                    socket,
+                    libc::connect,
+                    None,
+                )));
+            }
+            let endpoint = ip_endpoint(&socket.addr, socket.info.domain)?;
+            if !policy.network_access.allows_local_binding() || !endpoint.loopback {
+                let target = endpoint.addr.to_string();
+                let grant = SocketGrant::address(socket, libc::connect, None);
+                return deny_network(
+                    NetworkOperation::Connect,
+                    target,
+                    "connect",
+                    request.pid,
+                    grant,
+                    denials,
+                    query_enabled,
+                    next_query_id,
+                );
+            }
+            if udp_source_state(socket.sock.as_raw_fd())? == UdpSourceState::Other {
+                let target = endpoint.addr.to_string();
+                let grant = SocketGrant::address(socket, libc::connect, None);
+                return deny_network(
+                    NetworkOperation::Connect,
+                    target,
+                    "connect",
+                    request.pid,
+                    grant,
+                    denials,
+                    query_enabled,
+                    next_query_id,
+                );
+            }
+            let bind_addr = loopback_bind_addr(endpoint.addr);
+            Ok(NotificationResult::Socket(SocketGrant::address(
+                socket,
+                libc::connect,
+                Some(bind_addr),
             )))
         }
         SocketKind::Unix => handle_unix_connect(policy, request.pid, socket),
@@ -865,6 +937,249 @@ fn handle_connect(
         }
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
     }
+}
+
+fn handle_datagram_send(
+    policy: &AccessPolicy,
+    request: &libc::seccomp_notif,
+    denials: &mut Denials<'_>,
+    query_enabled: bool,
+    next_query_id: &mut u64,
+) -> SysResult<NotificationResult> {
+    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
+    let fd = RawFd::try_from(request.data.args[0]).map_err(|_| BrokerError::BadFileDescriptor)?;
+    let sock = duplicate_target_fd(pid, fd)?;
+    let info = SocketInfo::read(sock.as_raw_fd())?;
+    if info.kind() != SocketKind::Udp {
+        return Ok(NotificationResult::Continue);
+    }
+    if policy.network_access.is_unrestricted() {
+        return Ok(NotificationResult::Continue);
+    }
+
+    let (call, mut messages) = copy_datagram_request(request, pid)?;
+    let peer = socket_peer_endpoint(sock.as_raw_fd(), info.domain)?;
+    let has_addressed_message =
+        peer.is_some() || messages.iter().any(|message| message.addr.is_some());
+    let source_state = if has_addressed_message {
+        udp_source_state(sock.as_raw_fd())?
+    } else {
+        UdpSourceState::Unbound
+    };
+    let mut analysis = DatagramPolicyAnalysis::new(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        let endpoint = match &message.addr {
+            Some(addr) => Some(ip_endpoint(addr, info.domain)?),
+            None => peer,
+        };
+        if !analysis.classify(
+            index,
+            endpoint,
+            policy.network_access.allows_local_binding(),
+            source_state,
+        ) {
+            break;
+        }
+    }
+
+    let syscall = call.syscall();
+    if let Some(target) = analysis.denied_target {
+        if matches!(&call, DatagramCall::SendMmsg { .. }) {
+            messages.truncate(analysis.safe_message_count);
+        }
+        let grant = SocketGrant::datagram(sock, call, messages, None);
+        return deny_network(
+            NetworkOperation::Connect,
+            target.to_string(),
+            syscall,
+            request.pid,
+            grant,
+            denials,
+            query_enabled,
+            next_query_id,
+        );
+    }
+
+    Ok(NotificationResult::Socket(SocketGrant::datagram(
+        sock,
+        call,
+        messages,
+        analysis.loopback_bind_addr,
+    )))
+}
+
+fn copy_datagram_request(
+    request: &libc::seccomp_notif,
+    pid: Pid,
+) -> SysResult<(DatagramCall, Vec<DatagramMessage>)> {
+    let args = &request.data.args;
+    let syscall = i64::from(request.data.nr);
+    if syscall == libc::SYS_sendto {
+        let len = usize::try_from(args[2]).map_err(|_| BrokerError::SystemCall {
+            errno: libc::EMSGSIZE,
+        })?;
+        if len > MAX_DATAGRAM_BYTES {
+            return Err(BrokerError::SystemCall {
+                errno: libc::EMSGSIZE,
+            });
+        }
+        let payload = read_child_exact(pid, args[1], len)?;
+        let addr_len = usize::try_from(args[5]).map_err(|_| BrokerError::InvalidAddress)?;
+        let addr = read_optional_target_addr(pid, args[4], addr_len)?;
+        return Ok((
+            DatagramCall::SendTo {
+                flags: datagram_send_flags(args[3])?,
+            },
+            vec![DatagramMessage {
+                addr,
+                payload: vec![payload],
+                control: Vec::new(),
+            }],
+        ));
+    }
+
+    if syscall == libc::SYS_sendmsg {
+        let msg: libc::msghdr = read_child_value(pid, args[1])?;
+        return Ok((
+            DatagramCall::SendMsg {
+                flags: datagram_send_flags(args[2])?,
+            },
+            vec![copy_datagram_message(pid, &msg)?],
+        ));
+    }
+
+    if syscall == libc::SYS_sendmmsg {
+        let count = syscall_u32(args[2]) as usize;
+        if count > MAX_SENDMMSG_MESSAGES {
+            return Err(BrokerError::SystemCall {
+                errno: libc::EINVAL,
+            });
+        }
+        let base = usize::try_from(args[1]).map_err(|_| BrokerError::BadAddress)?;
+        let source: Vec<libc::mmsghdr> = read_child_values(pid, base, count)?;
+        let mut messages = Vec::with_capacity(source.len());
+        for message in &source {
+            messages.push(copy_datagram_message(pid, &message.msg_hdr)?);
+        }
+        return Ok((
+            DatagramCall::SendMmsg {
+                flags: datagram_send_flags(args[3])?,
+                output: MmsgOutput { pid, base },
+            },
+            messages,
+        ));
+    }
+
+    Err(BrokerError::SystemCall {
+        errno: libc::ENOSYS,
+    })
+}
+
+fn datagram_send_flags(value: u64) -> SysResult<i32> {
+    let flags = syscall_i32(value);
+    if flags & libc::MSG_ZEROCOPY != 0 {
+        // MSG_ZEROCOPY may retain references to userspace pages after sendmsg
+        // returns. Broker-owned payload storage is intentionally short-lived,
+        // so accepting it would break the immutable-copy guarantee.
+        return Err(BrokerError::SystemCall {
+            errno: libc::EOPNOTSUPP,
+        });
+    }
+    Ok(flags)
+}
+
+fn copy_datagram_message(pid: Pid, message: &libc::msghdr) -> SysResult<DatagramMessage> {
+    let addr_len = message.msg_namelen as usize;
+    let addr = read_optional_target_addr(pid, message.msg_name as u64, addr_len)?;
+    // libc uses size_t on glibc and signed int on musl for this field. `as _`
+    // keeps the conversion portable; a negative musl value becomes larger than
+    // the bound below and fails with EMSGSIZE.
+    let iov_count: usize = message.msg_iovlen as _;
+    if iov_count > MAX_MESSAGE_IOVECS {
+        return Err(BrokerError::SystemCall {
+            errno: libc::EMSGSIZE,
+        });
+    }
+    let iovecs: Vec<libc::iovec> = read_child_values(pid, message.msg_iov as usize, iov_count)?;
+    let mut total = 0_usize;
+    let mut payload = Vec::with_capacity(iovecs.len());
+    for iovec in iovecs {
+        total = total
+            .checked_add(iovec.iov_len)
+            .ok_or(BrokerError::SystemCall {
+                errno: libc::EMSGSIZE,
+            })?;
+        if total > MAX_DATAGRAM_BYTES {
+            return Err(BrokerError::SystemCall {
+                errno: libc::EMSGSIZE,
+            });
+        }
+        payload.push(read_child_exact(pid, iovec.iov_base as u64, iovec.iov_len)?);
+    }
+
+    let control_len: usize = message.msg_controllen as _;
+    if control_len > MAX_DATAGRAM_CONTROL_BYTES {
+        return Err(BrokerError::SystemCall {
+            errno: libc::ENOBUFS,
+        });
+    }
+    let control = read_child_exact(pid, message.msg_control as u64, control_len)?;
+    validate_datagram_control(&control)?;
+
+    Ok(DatagramMessage {
+        addr,
+        payload,
+        control,
+    })
+}
+
+fn validate_datagram_control(control: &[u8]) -> SysResult<()> {
+    let header_len = mem::size_of::<libc::cmsghdr>();
+    let alignment = mem::size_of::<usize>();
+    let mut offset = 0_usize;
+    while offset < control.len() {
+        if control.len() - offset < header_len {
+            return Err(BrokerError::SystemCall {
+                errno: libc::EINVAL,
+            });
+        }
+        // SAFETY: the bounds check above covers a complete cmsghdr; unaligned
+        // access is required because the copied byte vector has no C alignment.
+        let header =
+            unsafe { ptr::read_unaligned(control[offset..].as_ptr().cast::<libc::cmsghdr>()) };
+        let cmsg_len: usize = header.cmsg_len as _;
+        if cmsg_len < header_len || cmsg_len > control.len() - offset {
+            return Err(BrokerError::SystemCall {
+                errno: libc::EINVAL,
+            });
+        }
+        const UDP_SEGMENT: i32 = 103;
+        let supported = matches!(
+            (header.cmsg_level, header.cmsg_type),
+            (libc::IPPROTO_IP, libc::IP_TTL | libc::IP_TOS)
+                | (libc::IPPROTO_IPV6, libc::IPV6_HOPLIMIT | libc::IPV6_TCLASS)
+                | (libc::SOL_UDP, UDP_SEGMENT)
+        );
+        if !supported {
+            // In particular, reject IP_PKTINFO/IPV6_PKTINFO and routing headers:
+            // they can override the loopback source/interface or route selected
+            // after policy validation. Unknown controls also fail closed.
+            return Err(BrokerError::SystemCall {
+                errno: libc::EINVAL,
+            });
+        }
+        offset = offset
+            .checked_add(cmsg_len)
+            .and_then(|value| value.checked_add(alignment - 1))
+            .map(|value| value & !(alignment - 1))
+            .ok_or(BrokerError::SystemCall {
+                errno: libc::EINVAL,
+            })?;
+        if offset > control.len() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn handle_unix_connect(
@@ -892,11 +1207,11 @@ fn handle_unix_connect(
         rewrite_unix_path(&mut addr, &target)?;
     }
 
-    Ok(NotificationResult::Socket(SocketGrant {
-        sock: socket.sock,
-        addr,
-        call: libc::connect,
-    }))
+    Ok(NotificationResult::Socket(SocketGrant::address(
+        TargetSocket { addr, ..socket },
+        libc::connect,
+        None,
+    )))
 }
 
 fn handle_unix_bind(
@@ -917,9 +1232,10 @@ fn handle_unix_bind(
         rewrite_unix_path(&mut socket.addr, &target)?;
     }
 
-    Ok(NotificationResult::Socket(SocketGrant::new(
+    Ok(NotificationResult::Socket(SocketGrant::address(
         socket,
         libc::bind,
+        None,
     )))
 }
 
@@ -1012,13 +1328,17 @@ fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {
     Ok(())
 }
 
-fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
+fn sockaddr_family(addr: &[u8]) -> SysResult<i32> {
     let family = addr
         .get(..mem::size_of::<libc::sa_family_t>())
         .ok_or(BrokerError::InvalidAddress)?;
-    let family = <[u8; 2]>::try_from(family).map_err(|_| BrokerError::InvalidAddress)?;
+    let family = <[u8; mem::size_of::<libc::sa_family_t>()]>::try_from(family)
+        .map_err(|_| BrokerError::InvalidAddress)?;
+    Ok(i32::from(libc::sa_family_t::from_ne_bytes(family)))
+}
 
-    match (domain, i32::from(libc::sa_family_t::from_ne_bytes(family))) {
+fn ip_endpoint(addr: &[u8], domain: i32) -> SysResult<IpEndpoint> {
+    match (domain, sockaddr_family(addr)?) {
         (libc::AF_INET, libc::AF_INET) => {
             if addr.len() < mem::size_of::<libc::sockaddr_in>() {
                 return Err(BrokerError::InvalidAddress);
@@ -1026,7 +1346,7 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
 
             let port = u16::from_be_bytes([addr[2], addr[3]]);
             let ip = Ipv4Addr::new(addr[4], addr[5], addr[6], addr[7]);
-            Ok(TcpEndpoint {
+            Ok(IpEndpoint {
                 addr: SocketAddr::from((ip, port)),
                 port,
                 loopback: ip.is_loopback(),
@@ -1038,17 +1358,49 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
             }
 
             let port = u16::from_be_bytes([addr[2], addr[3]]);
+            let flowinfo = u32::from_be_bytes(
+                <[u8; 4]>::try_from(&addr[4..8]).map_err(|_| BrokerError::InvalidAddress)?,
+            );
             let ip = Ipv6Addr::from(
                 <[u8; 16]>::try_from(&addr[8..24]).map_err(|_| BrokerError::InvalidAddress)?,
             );
-            Ok(TcpEndpoint {
-                addr: SocketAddr::from((ip, port)),
+            let scope_id = u32::from_ne_bytes(
+                <[u8; 4]>::try_from(&addr[24..28]).map_err(|_| BrokerError::InvalidAddress)?,
+            );
+            Ok(IpEndpoint {
+                addr: SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope_id)),
                 port,
                 loopback: ip.is_loopback()
                     || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
             })
         }
         _ => Err(BrokerError::AddressFamilyNotSupported),
+    }
+}
+
+fn loopback_bind_addr(destination: SocketAddr) -> Vec<u8> {
+    match destination {
+        SocketAddr::V4(_) => {
+            let mut addr = vec![0_u8; mem::size_of::<libc::sockaddr_in>()];
+            addr[..2].copy_from_slice(&(libc::AF_INET as libc::sa_family_t).to_ne_bytes());
+            addr[4..8].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
+            addr
+        }
+        SocketAddr::V6(destination) => {
+            let mut addr = vec![0_u8; mem::size_of::<libc::sockaddr_in6>()];
+            addr[..2].copy_from_slice(&(libc::AF_INET6 as libc::sa_family_t).to_ne_bytes());
+            let ip = if destination
+                .ip()
+                .to_ipv4_mapped()
+                .is_some_and(|ip| ip.is_loopback())
+            {
+                *destination.ip()
+            } else {
+                Ipv6Addr::LOCALHOST
+            };
+            addr[8..24].copy_from_slice(&ip.octets());
+            addr
+        }
     }
 }
 
@@ -1089,6 +1441,72 @@ fn read_target_addr(pid: Pid, target_addr: usize, addr_len: usize) -> SysResult<
     }
 
     Ok(addr)
+}
+
+fn read_optional_target_addr(
+    pid: Pid,
+    target_addr: u64,
+    addr_len: usize,
+) -> SysResult<Option<Vec<u8>>> {
+    if addr_len == 0 {
+        return Ok(None);
+    }
+    if addr_len > mem::size_of::<libc::sockaddr_storage>() {
+        return Err(BrokerError::InvalidAddress);
+    }
+    let target_addr = usize::try_from(target_addr).map_err(|_| BrokerError::BadAddress)?;
+    if target_addr == 0 {
+        return Err(BrokerError::BadAddress);
+    }
+    read_target_addr(pid, target_addr, addr_len).map(Some)
+}
+
+fn read_child_exact(pid: Pid, target_addr: u64, len: usize) -> SysResult<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let target_addr = usize::try_from(target_addr).map_err(|_| BrokerError::BadAddress)?;
+    if target_addr == 0 {
+        return Err(BrokerError::BadAddress);
+    }
+    let mut bytes = vec![0_u8; len];
+    let mut local = [IoSliceMut::new(&mut bytes)];
+    let target = [RemoteIoVec {
+        base: target_addr,
+        len,
+    }];
+    let copied =
+        process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
+            errno: error as i32,
+        })?;
+    if copied != len {
+        return Err(BrokerError::BadAddress);
+    }
+    Ok(bytes)
+}
+
+fn read_child_value<T: Copy>(pid: Pid, target_addr: u64) -> SysResult<T> {
+    let bytes = read_child_exact(pid, target_addr, mem::size_of::<T>())?;
+    // SAFETY: bytes has exactly size_of::<T>() initialized bytes. The C syscall
+    // structs read through this helper contain only integer and pointer fields.
+    Ok(unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+}
+
+fn read_child_values<T: Copy>(pid: Pid, target_addr: usize, count: usize) -> SysResult<Vec<T>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let len = mem::size_of::<T>()
+        .checked_mul(count)
+        .ok_or(BrokerError::BadAddress)?;
+    let bytes = read_child_exact(pid, target_addr as _, len)?;
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = index * mem::size_of::<T>();
+        // SAFETY: each offset addresses one complete T-sized chunk in bytes.
+        values.push(unsafe { ptr::read_unaligned(bytes[offset..].as_ptr().cast::<T>()) });
+    }
+    Ok(values)
 }
 
 fn thread_group_leader(pid: Pid) -> SysResult<Pid> {
@@ -1165,6 +1583,77 @@ fn open_pidfd(pid: Pid, flags: libc::c_uint) -> std::result::Result<OwnedFd, Err
     let pidfd = RawFd::try_from(pidfd).map_err(|_| Errno::EBADF)?;
     // SAFETY: pidfd_open returned a new owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
+}
+
+fn socket_addr(
+    sock: RawFd,
+    call: unsafe extern "C" fn(
+        libc::c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+    ) -> libc::c_int,
+) -> SysResult<Vec<u8>> {
+    // SAFETY: sockaddr_storage is POD and zero is a valid initial byte pattern.
+    let mut storage = unsafe { mem::zeroed::<libc::sockaddr_storage>() };
+    let mut len = libc::socklen_t::try_from(mem::size_of_val(&storage))
+        .map_err(|_| BrokerError::InvalidAddress)?;
+    // SAFETY: storage and len are writable for the duration of the socket call.
+    let rc = unsafe {
+        call(
+            sock,
+            ptr::addr_of_mut!(storage).cast::<libc::sockaddr>(),
+            ptr::addr_of_mut!(len),
+        )
+    };
+    if rc < 0 {
+        return Err(BrokerError::SystemCall {
+            errno: Errno::last() as i32,
+        });
+    }
+    let len = len as usize;
+    if len > mem::size_of_val(&storage) {
+        return Err(BrokerError::InvalidAddress);
+    }
+    // SAFETY: storage is initialized through len by the successful kernel call.
+    Ok(unsafe { std::slice::from_raw_parts(ptr::addr_of!(storage).cast::<u8>(), len).to_vec() })
+}
+
+fn socket_peer_endpoint(sock: RawFd, domain: i32) -> SysResult<Option<IpEndpoint>> {
+    match socket_addr(sock, libc::getpeername) {
+        Ok(addr) => ip_endpoint(&addr, domain).map(Some),
+        Err(BrokerError::SystemCall {
+            errno: libc::ENOTCONN,
+        }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpSourceState {
+    Unbound,
+    Loopback,
+    Other,
+}
+
+fn udp_source_state(sock: RawFd) -> SysResult<UdpSourceState> {
+    let info = SocketInfo::read(sock)?;
+    let local = socket_addr(sock, libc::getsockname)?;
+    let endpoint = ip_endpoint(&local, info.domain)?;
+    if endpoint.loopback {
+        Ok(UdpSourceState::Loopback)
+    } else if endpoint.port == 0 && endpoint.addr.ip().is_unspecified() {
+        Ok(UdpSourceState::Unbound)
+    } else {
+        Ok(UdpSourceState::Other)
+    }
+}
+
+fn ensure_udp_loopback_source(sock: RawFd, bind_addr: &[u8]) -> SysResult<()> {
+    match udp_source_state(sock)? {
+        UdpSourceState::Loopback => Ok(()),
+        UdpSourceState::Unbound => broker_addr_call(sock, bind_addr, libc::bind).map(|_| ()),
+        UdpSourceState::Other => Err(BrokerError::PolicyDenied),
+    }
 }
 
 fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult<i64> {
@@ -1988,10 +2477,6 @@ fn handle_fd_utimensat(
 }
 
 impl Grant {
-    fn socket(sock: OwnedFd, addr: Vec<u8>, call: SocketAddrCall) -> Grant {
-        Grant::Socket(SocketGrant { sock, addr, call })
-    }
-
     fn mutation(
         spec: &Syscall,
         request: &libc::seccomp_notif,
@@ -2373,15 +2858,167 @@ fn grant_mutation(notify_fd: BorrowedFd<'_>, id: u64, grant: &MutationGrant) {
     let _ = respond_notification(notify_fd, rc);
 }
 
-// The broker re-issues the approved connect or bind on the duplicated child
-// socket, which shares the child's open file description, so the call takes
-// effect on the child's socket while running outside its seccomp filter.
+// The broker executes approved socket operations on a duplicated child fd,
+// which shares the child's open file description. Addresses, payloads, iovecs,
+// and controls were copied before policy authorization and are never re-read.
 fn grant_socket(notify_fd: BorrowedFd<'_>, id: u64, grant: &SocketGrant) {
-    let rc = match broker_addr_call(grant.sock.as_raw_fd(), &grant.addr, grant.call) {
+    let result = match &grant.operation {
+        SocketOperation::Address {
+            addr,
+            call,
+            bind_addr,
+        } => {
+            if let Some(bind_addr) = bind_addr {
+                ensure_udp_loopback_source(grant.sock.as_raw_fd(), bind_addr)
+                    .and_then(|()| broker_addr_call(grant.sock.as_raw_fd(), addr, *call))
+            } else {
+                broker_addr_call(grant.sock.as_raw_fd(), addr, *call)
+            }
+        }
+        SocketOperation::Datagram {
+            call,
+            messages,
+            bind_addr,
+        } => run_datagram_send(grant.sock.as_raw_fd(), call, messages, bind_addr.as_deref()),
+    };
+    let response = match result {
         Ok(value) => notification_value(id, value),
         Err(error) => notification_error(id, -error.errno().abs()),
     };
-    let _ = respond_notification(notify_fd, rc);
+    let _ = respond_notification(notify_fd, response);
+}
+
+fn run_datagram_send(
+    sock: RawFd,
+    call: &DatagramCall,
+    messages: &[DatagramMessage],
+    bind_addr: Option<&[u8]>,
+) -> SysResult<i64> {
+    if let Some(bind_addr) = bind_addr {
+        ensure_udp_loopback_source(sock, bind_addr)?;
+    }
+
+    match call {
+        DatagramCall::SendTo { flags } => {
+            let message = messages.first().ok_or(BrokerError::InvalidAddress)?;
+            let payload = message.payload.first().ok_or(BrokerError::InvalidAddress)?;
+            let (addr, addr_len) = message.addr.as_ref().map_or((ptr::null(), 0), |addr| {
+                (
+                    addr.as_ptr().cast::<libc::sockaddr>(),
+                    libc::socklen_t::try_from(addr.len()).unwrap_or(libc::socklen_t::MAX),
+                )
+            });
+            // SAFETY: every pointer refers to immutable broker-owned storage for
+            // the duration of sendto; zero lengths permit null pointers.
+            let rc = unsafe {
+                libc::sendto(
+                    sock,
+                    payload.as_ptr().cast(),
+                    payload.len(),
+                    *flags,
+                    addr,
+                    addr_len,
+                )
+            };
+            syscall_send_result(rc)
+        }
+        DatagramCall::SendMsg { flags } => {
+            let message = messages.first().ok_or(BrokerError::InvalidAddress)?;
+            send_datagram_message(sock, message, *flags)
+        }
+        DatagramCall::SendMmsg { flags, output } => {
+            let mut completed = 0_usize;
+            for (index, message) in messages.iter().enumerate() {
+                let result = send_datagram_message(sock, message, *flags).and_then(|length| {
+                    let length = u32::try_from(length).map_err(|_| BrokerError::SystemCall {
+                        errno: libc::EMSGSIZE,
+                    })?;
+                    write_mmsg_length(output, index, length)
+                });
+                match result {
+                    Ok(()) => completed += 1,
+                    Err(error) if completed == 0 => return Err(error),
+                    Err(_) => break,
+                }
+            }
+            i64::try_from(completed).map_err(|_| BrokerError::InvalidAddress)
+        }
+    }
+}
+
+fn send_datagram_message(sock: RawFd, message: &DatagramMessage, flags: i32) -> SysResult<i64> {
+    let mut iovecs: Vec<libc::iovec> = message
+        .payload
+        .iter()
+        .map(|payload| libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        })
+        .collect();
+    let (name, name_len) = message.addr.as_ref().map_or((ptr::null_mut(), 0), |addr| {
+        (
+            addr.as_ptr().cast_mut().cast(),
+            libc::socklen_t::try_from(addr.len()).unwrap_or(libc::socklen_t::MAX),
+        )
+    });
+    let control = if message.control.is_empty() {
+        ptr::null_mut()
+    } else {
+        message.control.as_ptr().cast_mut().cast()
+    };
+    // SAFETY: zero initializes the public fields and libc's target-specific
+    // padding fields to valid values before the pointers and lengths are set.
+    let mut header = unsafe { mem::zeroed::<libc::msghdr>() };
+    header.msg_name = name;
+    header.msg_namelen = name_len;
+    header.msg_iov = iovecs.as_mut_ptr();
+    // The broker bounds both values before this conversion; libc declares the
+    // fields as size_t on glibc and narrower integer types on musl.
+    header.msg_iovlen = iovecs.len() as _;
+    header.msg_control = control;
+    header.msg_controllen = message.control.len() as _;
+    // SAFETY: header points only into immutable broker-owned message storage and
+    // the live local iovec array for the duration of the call.
+    syscall_send_result(unsafe { libc::sendmsg(sock, ptr::addr_of!(header), flags) })
+}
+
+fn syscall_send_result(rc: libc::ssize_t) -> SysResult<i64> {
+    if rc < 0 {
+        Err(BrokerError::SystemCall {
+            errno: Errno::last() as i32,
+        })
+    } else {
+        Ok(rc as _)
+    }
+}
+
+fn write_mmsg_length(output: &MmsgOutput, index: usize, length: u32) -> SysResult<()> {
+    // SAFETY: length is live for the duration of the write and exposed as
+    // exactly its initialized native-endian byte representation.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(ptr::from_ref(&length).cast::<u8>(), mem::size_of::<u32>())
+    };
+    let local = [IoSlice::new(bytes)];
+    let stride = mem::size_of::<libc::mmsghdr>();
+    let offset = mem::offset_of!(libc::mmsghdr, msg_len);
+    let base = output
+        .base
+        .checked_add(index.checked_mul(stride).ok_or(BrokerError::BadAddress)?)
+        .and_then(|value| value.checked_add(offset))
+        .ok_or(BrokerError::BadAddress)?;
+    let remote = [RemoteIoVec {
+        base,
+        len: mem::size_of::<u32>(),
+    }];
+    let written = process_vm_writev(output.pid, &local, &remote).map_err(|error| {
+        BrokerError::SystemCall {
+            errno: error as i32,
+        }
+    })?;
+    if written != mem::size_of::<u32>() {
+        return Err(BrokerError::BadAddress);
+    }
+    Ok(())
 }
 
 fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
@@ -2771,6 +3408,11 @@ impl SocketInfo {
             && self.proto == libc::IPPROTO_TCP
         {
             SocketKind::Tcp
+        } else if matches!(self.domain, libc::AF_INET | libc::AF_INET6)
+            && self.ty == libc::SOCK_DGRAM
+            && self.proto == libc::IPPROTO_UDP
+        {
+            SocketKind::Udp
         } else if self.domain == libc::AF_UNIX {
             SocketKind::Unix
         } else if matches!(self.domain, libc::AF_INET | libc::AF_INET6)
@@ -2786,16 +3428,69 @@ impl SocketInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SocketKind {
     Tcp,
+    Udp,
     Unix,
     NotSupported,
     Other,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TcpEndpoint {
+struct IpEndpoint {
     addr: SocketAddr,
     port: u16,
     loopback: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DatagramPolicyAnalysis {
+    denied_target: Option<SocketAddr>,
+    loopback_bind_addr: Option<Vec<u8>>,
+    safe_message_count: usize,
+}
+
+impl DatagramPolicyAnalysis {
+    fn new(message_count: usize) -> Self {
+        Self {
+            denied_target: None,
+            loopback_bind_addr: None,
+            safe_message_count: message_count,
+        }
+    }
+
+    /// Returns whether policy analysis should continue with the next message.
+    fn classify(
+        &mut self,
+        index: usize,
+        endpoint: Option<IpEndpoint>,
+        allows_local_binding: bool,
+        source_state: UdpSourceState,
+    ) -> bool {
+        let Some(endpoint) = endpoint else {
+            return true;
+        };
+        let denied =
+            source_state == UdpSourceState::Other || !allows_local_binding || !endpoint.loopback;
+        if !denied {
+            if self.denied_target.is_none() && self.loopback_bind_addr.is_none() {
+                self.loopback_bind_addr = Some(loopback_bind_addr(endpoint.addr));
+            }
+            return true;
+        }
+
+        self.loopback_bind_addr = None;
+        if let Some(denied_target) = self.denied_target {
+            if endpoint.addr != denied_target {
+                // A grant may contain policy-allowed messages and denied messages
+                // for one structured target only. Keep this different target for
+                // a retry, preserving IPv6 flow and scope information in the key.
+                self.safe_message_count = index;
+                return false;
+            }
+        } else {
+            self.denied_target = Some(endpoint.addr);
+        }
+        true
+    }
 }
 
 enum NotificationResult {
@@ -2828,20 +3523,77 @@ enum Grant {
     Socket(SocketGrant),
 }
 
-// A duplicated child socket and the resolved target address for a connect or
-// bind the broker re-issues itself when a network query is approved.
+// A duplicated child socket plus immutable broker-owned operation data.
 struct SocketGrant {
     sock: OwnedFd,
-    addr: Vec<u8>,
-    call: SocketAddrCall,
+    operation: SocketOperation,
+}
+
+enum SocketOperation {
+    Address {
+        addr: Vec<u8>,
+        call: SocketAddrCall,
+        bind_addr: Option<Vec<u8>>,
+    },
+    Datagram {
+        call: DatagramCall,
+        messages: Vec<DatagramMessage>,
+        bind_addr: Option<Vec<u8>>,
+    },
+}
+
+struct DatagramMessage {
+    addr: Option<Vec<u8>>,
+    payload: Vec<Vec<u8>>,
+    control: Vec<u8>,
+}
+
+enum DatagramCall {
+    SendTo { flags: i32 },
+    SendMsg { flags: i32 },
+    SendMmsg { flags: i32, output: MmsgOutput },
+}
+
+impl DatagramCall {
+    fn syscall(&self) -> &'static str {
+        match self {
+            Self::SendTo { .. } => "sendto",
+            Self::SendMsg { .. } => "sendmsg",
+            Self::SendMmsg { .. } => "sendmmsg",
+        }
+    }
+}
+
+struct MmsgOutput {
+    pid: Pid,
+    base: usize,
 }
 
 impl SocketGrant {
-    fn new(socket: TargetSocket, call: SocketAddrCall) -> Self {
+    fn address(socket: TargetSocket, call: SocketAddrCall, bind_addr: Option<Vec<u8>>) -> Self {
         Self {
             sock: socket.sock,
-            addr: socket.addr,
-            call,
+            operation: SocketOperation::Address {
+                addr: socket.addr,
+                call,
+                bind_addr,
+            },
+        }
+    }
+
+    fn datagram(
+        sock: OwnedFd,
+        call: DatagramCall,
+        messages: Vec<DatagramMessage>,
+        bind_addr: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            sock,
+            operation: SocketOperation::Datagram {
+                call,
+                messages,
+                bind_addr,
+            },
         }
     }
 }
@@ -2944,6 +3696,10 @@ pub(super) struct NotificationSyscalls {
     pub(super) bind: i64,
     pub(super) connect: i64,
     pub(super) socket: i64,
+    pub(super) io_uring_setup: i64,
+    sendto: i64,
+    sendmsg: i64,
+    sendmmsg: i64,
     openat: i64,
     openat2: i64,
     open: Option<i64>,
@@ -2957,12 +3713,24 @@ impl NotificationSyscalls {
             bind: libc::SYS_bind,
             connect: libc::SYS_connect,
             socket: libc::SYS_socket,
+            io_uring_setup: libc::SYS_io_uring_setup,
+            sendto: libc::SYS_sendto,
+            sendmsg: libc::SYS_sendmsg,
+            sendmmsg: libc::SYS_sendmmsg,
             openat: libc::SYS_openat,
             openat2: libc::SYS_openat2,
             open: legacy_syscall::OPEN,
             name_to_handle_at: libc::SYS_name_to_handle_at,
             open_by_handle_at: libc::SYS_open_by_handle_at,
         }
+    }
+
+    fn datagram_send_syscalls(&self) -> [i64; 3] {
+        [self.sendto, self.sendmsg, self.sendmmsg]
+    }
+
+    fn is_datagram_send(&self, syscall: i64) -> bool {
+        syscall == self.sendto || syscall == self.sendmsg || syscall == self.sendmmsg
     }
 
     fn is_open(&self, syscall: i64) -> bool {
@@ -2999,5 +3767,144 @@ fn exit_code(status: WaitStatus) -> i32 {
         WaitStatus::Exited(_, code) => code,
         WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
         _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(addr: SocketAddr, loopback: bool) -> IpEndpoint {
+        IpEndpoint {
+            addr,
+            port: addr.port(),
+            loopback,
+        }
+    }
+
+    fn analyze(
+        endpoints: &[IpEndpoint],
+        allows_local_binding: bool,
+        source_state: UdpSourceState,
+    ) -> DatagramPolicyAnalysis {
+        let mut analysis = DatagramPolicyAnalysis::new(endpoints.len());
+        for (index, endpoint) in endpoints.iter().copied().enumerate() {
+            if !analysis.classify(index, Some(endpoint), allows_local_binding, source_state) {
+                break;
+            }
+        }
+        analysis
+    }
+
+    #[test]
+    fn ip_endpoint_preserves_ipv6_socket_address_fields() -> SysResult<()> {
+        let ip = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let port = 40_001_u16;
+        let flowinfo = 0x0012_3456_u32;
+        let scope_id = 7_u32;
+        let family =
+            libc::sa_family_t::try_from(libc::AF_INET6).map_err(|_| BrokerError::InvalidAddress)?;
+        let addr = libc::sockaddr_in6 {
+            sin6_family: family,
+            sin6_port: port.to_be(),
+            sin6_flowinfo: flowinfo.to_be(),
+            sin6_addr: libc::in6_addr {
+                s6_addr: ip.octets(),
+            },
+            sin6_scope_id: scope_id,
+        };
+        // SAFETY: `addr` is alive for the duration of the slice, which spans
+        // exactly its initialized object representation.
+        let serialized = unsafe {
+            std::slice::from_raw_parts(
+                ptr::from_ref(&addr).cast::<u8>(),
+                mem::size_of::<libc::sockaddr_in6>(),
+            )
+        };
+
+        let endpoint = ip_endpoint(serialized, libc::AF_INET6)?;
+
+        assert_eq!(
+            endpoint.addr,
+            SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope_id))
+        );
+        assert_eq!(endpoint.port, port);
+        Ok(())
+    }
+
+    #[test]
+    fn sendmmsg_grant_stops_before_a_different_denied_target() {
+        let target_a = SocketAddr::from(([192, 0, 2, 1], 4001));
+        let target_b = SocketAddr::from(([192, 0, 2, 1], 4002));
+        let analysis = analyze(
+            &[endpoint(target_a, false), endpoint(target_b, false)],
+            true,
+            UdpSourceState::Unbound,
+        );
+
+        assert_eq!(analysis.denied_target, Some(target_a));
+        assert_eq!(analysis.safe_message_count, 1);
+    }
+
+    #[test]
+    fn sendmmsg_grant_stops_before_same_ipv6_target_on_a_different_scope() {
+        let ip = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let target_a = SocketAddr::V6(SocketAddrV6::new(ip, 4001, 0, 2));
+        let target_b = SocketAddr::V6(SocketAddrV6::new(ip, 4001, 0, 3));
+        let analysis = analyze(
+            &[endpoint(target_a, false), endpoint(target_b, false)],
+            true,
+            UdpSourceState::Unbound,
+        );
+
+        assert_eq!(analysis.denied_target, Some(target_a));
+        assert_eq!(analysis.safe_message_count, 1);
+    }
+
+    #[test]
+    fn sendmmsg_grant_keeps_allowed_messages_around_denied_target() {
+        let loopback_a = SocketAddr::from(([127, 0, 0, 1], 3001));
+        let target = SocketAddr::from(([192, 0, 2, 1], 4001));
+        let loopback_b = SocketAddr::from(([127, 0, 0, 1], 3002));
+        let analysis = analyze(
+            &[
+                endpoint(loopback_a, true),
+                endpoint(target, false),
+                endpoint(loopback_b, true),
+            ],
+            true,
+            UdpSourceState::Unbound,
+        );
+
+        assert_eq!(analysis.denied_target, Some(target));
+        assert_eq!(analysis.safe_message_count, 3);
+    }
+
+    #[test]
+    fn sendmmsg_grant_keeps_repeated_denied_target() {
+        let target = SocketAddr::from(([192, 0, 2, 1], 4001));
+        let analysis = analyze(
+            &[endpoint(target, false), endpoint(target, false)],
+            true,
+            UdpSourceState::Unbound,
+        );
+
+        assert_eq!(analysis.denied_target, Some(target));
+        assert_eq!(analysis.safe_message_count, 2);
+    }
+
+    #[test]
+    fn sendmmsg_source_denial_is_split_by_destination() {
+        let target_a = SocketAddr::from(([127, 0, 0, 1], 3001));
+        let target_b = SocketAddr::from(([127, 0, 0, 1], 3002));
+        let analysis = analyze(
+            &[endpoint(target_a, true), endpoint(target_b, true)],
+            true,
+            UdpSourceState::Other,
+        );
+
+        assert_eq!(analysis.denied_target, Some(target_a));
+        assert_eq!(analysis.safe_message_count, 1);
+        assert_eq!(analysis.loopback_bind_addr, None);
     }
 }

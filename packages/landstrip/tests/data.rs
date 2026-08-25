@@ -25,6 +25,8 @@ const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
 const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
 const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
 const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
+const UDP_PROBE_ARG: &str = "--test-udp";
+const IO_URING_PROBE_ARG: &str = "--test-io-uring";
 
 fn main() {
     let mut args = std::env::args_os();
@@ -46,6 +48,12 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(SIGNAL_THREAD_PROBE_ARG) => {
             std::process::exit(signal_thread_probe());
+        }
+        Some(value) if value == std::ffi::OsStr::new(UDP_PROBE_ARG) => {
+            std::process::exit(udp_probe(args.next(), args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(IO_URING_PROBE_ARG) => {
+            std::process::exit(io_uring_probe());
         }
         _ => {}
     }
@@ -193,6 +201,19 @@ enum Net {
     UnixAbstractDenied,
     SignalOutsideDenied,
     SignalThreadAllowed,
+    UdpBindDenied,
+    UdpLoopback,
+    UdpDisconnect,
+    UdpIpv6,
+    UdpUnrestricted,
+    UdpWildcardDenied,
+    UdpNonLoopbackBindDenied,
+    UdpSendtoDenied,
+    UdpSendmsgDenied,
+    UdpSendmmsgDenied,
+    UdpSendmmsgQuery,
+    UdpSendmmsgWriteFault,
+    IoUringDenied,
 }
 
 /// Fs action driven natively by the harness (no shell/tool can O_PATH portably).
@@ -583,6 +604,19 @@ fn parse_net(value: &str) -> Net {
         "unix-abstract-denied" => Net::UnixAbstractDenied,
         "signal-outside-denied" => Net::SignalOutsideDenied,
         "signal-thread-allowed" => Net::SignalThreadAllowed,
+        "udp-bind-denied" => Net::UdpBindDenied,
+        "udp-loopback" => Net::UdpLoopback,
+        "udp-disconnect" => Net::UdpDisconnect,
+        "udp-ipv6" => Net::UdpIpv6,
+        "udp-unrestricted" => Net::UdpUnrestricted,
+        "udp-wildcard-denied" => Net::UdpWildcardDenied,
+        "udp-non-loopback-bind-denied" => Net::UdpNonLoopbackBindDenied,
+        "udp-sendto-denied" => Net::UdpSendtoDenied,
+        "udp-sendmsg-denied" => Net::UdpSendmsgDenied,
+        "udp-sendmmsg-denied" => Net::UdpSendmmsgDenied,
+        "udp-sendmmsg-query" => Net::UdpSendmmsgQuery,
+        "udp-sendmmsg-write-fault" => Net::UdpSendmmsgWriteFault,
+        "io-uring-denied" => Net::IoUringDenied,
         other => panic!("unknown net kind `{other}`"),
     }
 }
@@ -745,6 +779,454 @@ fn truncate_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 
+fn udp_probe(mode: Option<std::ffi::OsString>, argument: Option<std::ffi::OsString>) -> i32 {
+    let Some(mode) = mode.and_then(|value| value.into_string().ok()) else {
+        return 2;
+    };
+    let result = match mode.as_str() {
+        "bind4" => UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map(|_| ()),
+        "bind-wildcard" => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map(|_| ()),
+        "bind-address" => argument
+            .and_then(|value| value.into_string().ok())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            .and_then(|address| UdpSocket::bind(format!("{address}:0")).map(|_| ())),
+        "roundtrip4" => udp_roundtrip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        "roundtrip6" => udp_roundtrip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        "disconnect" => udp_disconnect(),
+        "sendto" => argument
+            .and_then(|value| value.into_string().ok())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            .and_then(|address| {
+                let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+                socket.send_to(b"blocked", address).map(|_| ())
+            }),
+        "sendmsg" => udp_sendmsg(argument),
+        "sendmmsg" => udp_sendmmsg(argument),
+        "sendmmsg-write-fault" => udp_sendmmsg_write_fault(argument),
+        _ => return 2,
+    };
+    if result.is_ok() { 0 } else { 1 }
+}
+
+#[cfg(target_os = "linux")]
+fn udp_disconnect() -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let client = unbound_udp(IpAddr::V4(Ipv4Addr::LOCALHOST))?;
+    let first = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let second = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    second.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+    client.connect(first.local_addr()?)?;
+    let disconnect_addr = libc::sockaddr {
+        sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+        sa_data: [0; 14],
+    };
+    let disconnect_len = libc::socklen_t::try_from(std::mem::size_of_val(&disconnect_addr))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: disconnect_addr is a live sockaddr whose AF_UNSPEC family requests
+    // the standard Linux datagram disconnect operation.
+    let rc = unsafe {
+        libc::connect(
+            client.as_raw_fd(),
+            std::ptr::addr_of!(disconnect_addr),
+            disconnect_len,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    match client.peer_addr() {
+        Err(error) if error.raw_os_error() == Some(libc::ENOTCONN) => {}
+        Err(error) => return Err(error),
+        Ok(peer) => {
+            return Err(std::io::Error::other(format!(
+                "UDP socket remained connected to {peer}"
+            )));
+        }
+    }
+
+    client.connect(second.local_addr()?)?;
+    client.send(b"reconnected")?;
+    let mut payload = [0_u8; 32];
+    let (length, _) = second.recv_from(&mut payload)?;
+    if &payload[..length] != b"reconnected" {
+        return Err(std::io::Error::other(
+            "reconnected UDP socket sent an unexpected payload",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_disconnect() -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+fn udp_roundtrip(ip: IpAddr) -> std::io::Result<()> {
+    let server = UdpSocket::bind((ip, 0))?;
+    let client = unbound_udp(ip)?;
+    server.set_read_timeout(Some(Duration::from_secs(2)))?;
+    client.set_read_timeout(Some(Duration::from_secs(2)))?;
+    client.connect(server.local_addr()?)?;
+    if !client.local_addr()?.ip().is_loopback() {
+        return Err(std::io::Error::other(
+            "UDP connect did not select a loopback source",
+        ));
+    }
+    client.send(b"request")?;
+
+    let mut request = [0_u8; 32];
+    let (length, source) = server.recv_from(&mut request)?;
+    if &request[..length] != b"request" {
+        return Err(std::io::Error::other("unexpected UDP request"));
+    }
+    server.send_to(b"reply", source)?;
+    let mut reply = [0_u8; 32];
+    let length = client.recv(&mut reply)?;
+    if &reply[..length] != b"reply" {
+        return Err(std::io::Error::other("unexpected UDP reply"));
+    }
+
+    let sender = unbound_udp(ip)?;
+    sender.send_to(b"unconnected", server.local_addr()?)?;
+    let (length, source) = server.recv_from(&mut request)?;
+    if &request[..length] != b"unconnected" || !source.ip().is_loopback() {
+        return Err(std::io::Error::other(
+            "unconnected UDP send did not use loopback",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unbound_udp(ip: IpAddr) -> std::io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+
+    let domain = match ip {
+        IpAddr::V4(_) => libc::AF_INET,
+        IpAddr::V6(_) => libc::AF_INET6,
+    };
+    // SAFETY: socket copies scalar arguments and returns a newly owned fd.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: socket returned a new UDP descriptor whose ownership transfers.
+    Ok(unsafe { UdpSocket::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn unbound_udp(ip: IpAddr) -> std::io::Result<UdpSocket> {
+    UdpSocket::bind((ip, 0))
+}
+
+#[cfg(target_os = "linux")]
+fn udp_sendmsg(argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
+    use std::net::SocketAddr;
+    use std::os::fd::AsRawFd;
+
+    let destination: SocketAddr = argument
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
+        .parse()
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let SocketAddr::V4(destination) = destination else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let payload = b"blocked";
+    let mut iovec = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    // SAFETY: zero is a valid initial representation for sockaddr_in/msghdr.
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_in>() };
+    address.sin_family = libc::AF_INET as libc::sa_family_t;
+    address.sin_port = destination.port().to_be();
+    address.sin_addr.s_addr = u32::from_ne_bytes(destination.ip().octets());
+    // SAFETY: zero also initializes target-specific libc padding fields.
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_name = std::ptr::addr_of_mut!(address).cast();
+    message.msg_namelen = libc::socklen_t::try_from(std::mem::size_of_val(&address)).unwrap();
+    message.msg_iov = std::ptr::addr_of_mut!(iovec);
+    message.msg_iovlen = 1;
+    // SAFETY: message references live address, iovec, and payload storage.
+    let rc = unsafe { libc::sendmsg(socket.as_raw_fd(), std::ptr::addr_of!(message), 0) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_sendmsg(_argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+#[cfg(target_os = "linux")]
+fn udp_sendmmsg(argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
+    use std::net::SocketAddr;
+    use std::os::fd::AsRawFd;
+
+    let argument = argument
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let (first, second) = argument
+        .split_once(',')
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destinations = [first, second]
+        .map(|value| value.parse::<SocketAddr>())
+        .map(|result| result.map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput)))
+        .into_iter()
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let socket = unbound_udp(IpAddr::V4(Ipv4Addr::LOCALHOST))?;
+    let payloads: [&[u8]; 2] = [b"first", b"blocked"];
+    let mut addresses = Vec::with_capacity(destinations.len());
+    for destination in &destinations {
+        let SocketAddr::V4(destination) = destination else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        // SAFETY: zero is a valid initial sockaddr_in representation.
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_in>() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_port = destination.port().to_be();
+        address.sin_addr.s_addr = u32::from_ne_bytes(destination.ip().octets());
+        addresses.push(address);
+    }
+    let mut iovecs: Vec<libc::iovec> = payloads
+        .iter()
+        .map(|payload| libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        })
+        .collect();
+    let mut messages = Vec::with_capacity(addresses.len());
+    for index in 0..addresses.len() {
+        // SAFETY: zero also initializes target-specific libc padding fields.
+        let mut message = unsafe { std::mem::zeroed::<libc::mmsghdr>() };
+        message.msg_hdr.msg_name = std::ptr::from_mut(&mut addresses[index]).cast();
+        message.msg_hdr.msg_namelen =
+            libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_in>()).unwrap();
+        message.msg_hdr.msg_iov = std::ptr::from_mut(&mut iovecs[index]);
+        message.msg_hdr.msg_iovlen = 1;
+        messages.push(message);
+    }
+    let mut sent = 0_usize;
+    while sent < messages.len() {
+        // SAFETY: the suffix and all referenced broker-input storage remain live.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_sendmmsg,
+                socket.as_raw_fd(),
+                messages.as_mut_ptr().add(sent),
+                messages.len() - sent,
+                0,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = usize::try_from(rc)
+            .map_err(|_| std::io::Error::other("sendmmsg returned an invalid count"))?;
+        if count == 0 || count > messages.len() - sent {
+            return Err(std::io::Error::other(
+                "sendmmsg did not make valid partial progress",
+            ));
+        }
+        sent += count;
+        if messages[sent..].iter().any(|message| message.msg_len != 0) {
+            return Err(std::io::Error::other(
+                "sendmmsg updated the length of an unsent message",
+            ));
+        }
+    }
+    if messages
+        .iter()
+        .zip(payloads)
+        .any(|(message, payload)| message.msg_len as usize != payload.len())
+    {
+        return Err(std::io::Error::other(
+            "sendmmsg did not update each sent message length",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_sendmmsg(_argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+#[cfg(target_os = "linux")]
+fn udp_sendmmsg_write_fault(argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
+    use std::net::SocketAddr;
+    use std::os::fd::AsRawFd;
+
+    let destination: SocketAddr = argument
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
+        .parse()
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let SocketAddr::V4(destination) = destination else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    let socket = unbound_udp(IpAddr::V4(Ipv4Addr::LOCALHOST))?;
+    let payloads: [&[u8]; 2] = [b"first", b"second"];
+    let mut addresses = Vec::with_capacity(payloads.len());
+    for _ in &payloads {
+        // SAFETY: zero is a valid initial sockaddr_in representation.
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_in>() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_port = destination.port().to_be();
+        address.sin_addr.s_addr = u32::from_ne_bytes(destination.ip().octets());
+        addresses.push(address);
+    }
+    let mut iovecs: Vec<libc::iovec> = payloads
+        .iter()
+        .map(|payload| libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        })
+        .collect();
+
+    // SAFETY: sysconf reads a process-global constant.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = usize::try_from(page_size)
+        .map_err(|_| std::io::Error::other("could not determine the page size"))?;
+    let messages_size = payloads
+        .len()
+        .checked_mul(std::mem::size_of::<libc::mmsghdr>())
+        .ok_or_else(|| std::io::Error::other("sendmmsg array size overflow"))?;
+    if messages_size > page_size {
+        return Err(std::io::Error::other(
+            "sendmmsg array does not fit in one page",
+        ));
+    }
+
+    // SAFETY: mmap creates page-aligned private storage owned by this probe.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    let messages = mapping.cast::<libc::mmsghdr>();
+    for index in 0..payloads.len() {
+        // SAFETY: zero initializes the target-specific padding fields, and each
+        // array entry lies within the writable mapping.
+        let mut message = unsafe { std::mem::zeroed::<libc::mmsghdr>() };
+        message.msg_hdr.msg_name = std::ptr::from_mut(&mut addresses[index]).cast();
+        message.msg_hdr.msg_namelen =
+            libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_in>()).unwrap();
+        message.msg_hdr.msg_iov = std::ptr::from_mut(&mut iovecs[index]);
+        message.msg_hdr.msg_iovlen = 1;
+        // SAFETY: messages points to enough aligned, writable mmap storage.
+        unsafe { std::ptr::write(messages.add(index), message) };
+    }
+
+    // SAFETY: the complete mapping is live and page-aligned.
+    if unsafe { libc::mprotect(mapping, page_size, libc::PROT_READ) } < 0 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: mapping and page_size are the values returned to this probe.
+        let _ = unsafe { libc::munmap(mapping, page_size) };
+        return Err(error);
+    }
+    // SAFETY: the read-only message array and all referenced input storage stay
+    // live for the duration of sendmmsg. The kernel is expected to fault when it
+    // writes the first entry's msg_len after sending that entry.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_sendmmsg,
+            socket.as_raw_fd(),
+            messages,
+            u32::try_from(payloads.len()).unwrap(),
+            0,
+        )
+    };
+    let send_errno = if rc == -1 {
+        std::io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+
+    // Restore the mapping before releasing it so cleanup does not rely on the
+    // faulting protection state.
+    // SAFETY: mapping and page_size still describe the complete live mapping.
+    let restore_rc =
+        unsafe { libc::mprotect(mapping, page_size, libc::PROT_READ | libc::PROT_WRITE) };
+    let restore_error = if restore_rc < 0 {
+        std::io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    // SAFETY: mapping has not been unmapped yet.
+    let unmap_rc = unsafe { libc::munmap(mapping, page_size) };
+    let unmap_error = if unmap_rc < 0 {
+        std::io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    if let Some(errno) = restore_error {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    if let Some(errno) = unmap_error {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    if rc == -1 && send_errno == Some(libc::EFAULT) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "sendmmsg returned {rc} with errno {:?}, expected -1/EFAULT",
+            send_errno
+        )))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_sendmmsg_write_fault(_argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_probe() -> i32 {
+    #[repr(C, align(8))]
+    struct Params([u8; 256]);
+
+    let mut params = Params([0; 256]);
+    // SAFETY: io_uring_setup copies an io_uring_params structure no larger than
+    // the aligned zeroed backing storage. A successful descriptor is closed.
+    let rc = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1_u32, params.0.as_mut_ptr()) };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+            0
+        } else {
+            eprintln!("io_uring_setup failed with unexpected error: {error}");
+            1
+        }
+    } else {
+        if let Ok(fd) = i32::try_from(rc) {
+            // SAFETY: a nonnegative io_uring_setup return value is a new fd.
+            unsafe { libc::close(fd) };
+        }
+        1
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn io_uring_probe() -> i32 {
+    2
+}
+
 fn parse_status(value: &str) -> Status {
     match value {
         "0" => Status::Zero,
@@ -822,6 +1304,396 @@ fn run_net(
         Net::UnixAbstractDenied => run_unix_abstract_denied(ctx, format, policies),
         Net::SignalOutsideDenied => run_signal_outside_denied(ctx, format, policies),
         Net::SignalThreadAllowed => run_signal_thread_allowed(ctx, format, policies),
+        Net::UdpBindDenied => run_udp_expected(ctx, format, policies, "bind4", None, false, None),
+        Net::UdpLoopback => run_udp_expected(ctx, format, policies, "roundtrip4", None, true, None),
+        Net::UdpDisconnect => {
+            run_udp_expected(ctx, format, policies, "disconnect", None, true, None)
+        }
+        Net::UdpIpv6 => {
+            if UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
+                Ok(())
+            } else {
+                run_udp_expected(ctx, format, policies, "roundtrip6", None, true, None)
+            }
+        }
+        Net::UdpUnrestricted => {
+            run_udp_expected(ctx, format, policies, "roundtrip4", None, true, None)
+        }
+        Net::UdpWildcardDenied => run_udp_expected(
+            ctx,
+            format,
+            policies,
+            "bind-wildcard",
+            None,
+            false,
+            Some(("0.0.0.0:0", "bind")),
+        ),
+        Net::UdpNonLoopbackBindDenied => {
+            let Some(address) = non_loopback_ipv4() else {
+                return Ok(());
+            };
+            let address = address.to_string();
+            run_udp_expected(
+                ctx,
+                format,
+                policies,
+                "bind-address",
+                Some(&address),
+                false,
+                Some((&format!("{address}:0"), "bind")),
+            )
+        }
+        Net::UdpSendtoDenied => run_udp_external_denied(ctx, format, policies, "sendto"),
+        Net::UdpSendmsgDenied => run_udp_external_denied(ctx, format, policies, "sendmsg"),
+        Net::UdpSendmmsgDenied => run_udp_sendmmsg_denied(ctx, format, policies),
+        Net::UdpSendmmsgQuery => run_udp_sendmmsg_query(ctx, format, policies),
+        Net::UdpSendmmsgWriteFault => run_udp_sendmmsg_write_fault(ctx, format, policies),
+        Net::IoUringDenied => run_io_uring_denied(ctx, format, policies),
+    }
+}
+
+fn run_udp_expected(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    mode: &str,
+    argument: Option<&str>,
+    allowed: bool,
+    denial: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+    let mut command = landstrip_net(ctx, format, policies);
+    command.arg(exe).arg(UDP_PROBE_ARG).arg(mode);
+    if let Some(argument) = argument {
+        command.arg(argument);
+    }
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("spawn UDP {mode} probe: {error}"))?;
+    let merged = merge(&output.stdout, &output.stderr);
+    if output.status.success() != allowed {
+        return Err(format!(
+            "UDP {mode} was {}expected to be allowed; status={:?} output={}",
+            if allowed { "not " } else { "" },
+            output.status,
+            merged.trim()
+        ));
+    }
+    if let Some((target, syscall)) = denial {
+        let operation = if syscall == "bind" { "bind" } else { "connect" };
+        if !merged.contains(r#""kind":"network","code":"NETWORK_DENIED""#)
+            || !merged.contains(&format!(r#""operation":"{operation}""#))
+            || !merged.contains(&format!(r#""target":"{target}""#))
+            || !merged.contains(&format!(r#""syscall":"{syscall}""#))
+        {
+            return Err(format!(
+                "UDP {mode} denial had the wrong trap; output={}",
+                merged.trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_udp_external_denied(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    mode: &str,
+) -> Result<(), String> {
+    let Some(address) = non_loopback_ipv4() else {
+        return Ok(());
+    };
+    let argument = format!("{address}:9");
+    run_udp_expected(
+        ctx,
+        format,
+        policies,
+        mode,
+        Some(&argument),
+        false,
+        Some((&argument, mode)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn run_udp_sendmmsg_write_fault(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("bind sendmmsg write-fault receiver: {error}"))?;
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set sendmmsg write-fault receiver timeout: {error}"))?;
+    let destination = receiver
+        .local_addr()
+        .map_err(|error| format!("read sendmmsg write-fault receiver address: {error}"))?;
+    run_udp_expected(
+        ctx,
+        format,
+        policies,
+        "sendmmsg-write-fault",
+        Some(&destination.to_string()),
+        true,
+        None,
+    )?;
+
+    receive_udp_payload(&receiver, b"first", "write-fault")?;
+    expect_no_udp_payload(&receiver, "after write fault")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_udp_sendmmsg_write_fault(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+) -> Result<(), String> {
+    Err("sendmmsg write faults are linux-only".to_owned())
+}
+
+fn run_udp_sendmmsg_denied(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    let Some(external) = non_loopback_ipv4() else {
+        return Ok(());
+    };
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("bind sendmmsg receiver: {error}"))?;
+    receiver
+        .set_nonblocking(true)
+        .map_err(|error| format!("set sendmmsg receiver nonblocking: {error}"))?;
+    let first = receiver
+        .local_addr()
+        .map_err(|error| format!("read sendmmsg receiver address: {error}"))?;
+    let argument = format!("{first},{external}:9");
+    run_udp_expected(
+        ctx,
+        format,
+        policies,
+        "sendmmsg",
+        Some(&argument),
+        false,
+        Some((&format!("{external}:9"), "sendmmsg")),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(100));
+    let mut payload = [0_u8; 16];
+    match receiver.recv_from(&mut payload) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Ok(_) => Err("sendmmsg emitted an allowed datagram before denying its batch".to_owned()),
+        Err(error) => Err(format!("read sendmmsg receiver: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_udp_sendmmsg_query(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    use std::io::BufReader;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+
+    let Some(external) = non_loopback_ipv4() else {
+        return Ok(());
+    };
+    let receiver_a = UdpSocket::bind((external, 0))
+        .map_err(|error| format!("bind sendmmsg receiver A: {error}"))?;
+    let receiver_b = UdpSocket::bind((external, 0))
+        .map_err(|error| format!("bind sendmmsg receiver B: {error}"))?;
+    for receiver in [&receiver_a, &receiver_b] {
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| format!("set sendmmsg receiver timeout: {error}"))?;
+    }
+    let target_a = receiver_a
+        .local_addr()
+        .map_err(|error| format!("read sendmmsg receiver A address: {error}"))?;
+    let target_b = receiver_b
+        .local_addr()
+        .map_err(|error| format!("read sendmmsg receiver B address: {error}"))?;
+
+    let (mut control, child_control) =
+        UnixStream::pair().map_err(|error| format!("create trap socket pair: {error}"))?;
+    control
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("set trap socket timeout: {error}"))?;
+    let reader_socket = control
+        .try_clone()
+        .map_err(|error| format!("clone trap socket: {error}"))?;
+    let mut reader = BufReader::new(reader_socket);
+
+    let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+    let mut command = Command::new(&ctx.bin);
+    command.arg("run");
+    if format == PolicyFormat::Yaml {
+        command.args(["--policy-format", "yaml"]);
+    }
+    command.args(["--trap-fd", "3"]);
+    for policy in policies {
+        command.arg("-p").arg(policy);
+    }
+    command
+        .arg("--")
+        .arg(exe)
+        .arg(UDP_PROBE_ARG)
+        .arg("sendmmsg")
+        .arg(format!("{target_a},{target_b}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the socket stays live in the closure until dup2 copies it to fd 3
+    // in the child, and FD_CLOEXEC is then cleared before landstrip is execed.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(child_control.as_raw_fd(), 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn interactive sendmmsg probe: {error}"))?;
+    drop(command);
+
+    let interaction = (|| -> Result<(), String> {
+        let query_a = read_udp_query(&mut reader, target_a)?;
+        allow_query(&mut control, &query_a)?;
+
+        let query_b = read_udp_query(&mut reader, target_b)?;
+        if query_a == query_b {
+            return Err("sendmmsg retries reused the first query id".to_owned());
+        }
+        receive_udp_payload(&receiver_a, b"first", "A")?;
+        expect_no_udp_payload(&receiver_b, "B")?;
+
+        allow_query(&mut control, &query_b)?;
+        receive_udp_payload(&receiver_b, b"blocked", "B")
+    })();
+    if let Err(error) = interaction {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait interactive sendmmsg probe: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "interactive sendmmsg probe failed; status={:?} output={}",
+            output.status,
+            merge(&output.stdout, &output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_udp_query(
+    reader: &mut impl std::io::BufRead,
+    expected_target: std::net::SocketAddr,
+) -> Result<String, String> {
+    let mut line = String::new();
+    let length = reader
+        .read_line(&mut line)
+        .map_err(|error| format!("read sendmmsg query: {error}"))?;
+    if length == 0 {
+        return Err("trap socket closed before sendmmsg query".to_owned());
+    }
+    let trap: serde_json::Value = serde_json::from_str(&line)
+        .map_err(|error| format!("parse sendmmsg query `{}`: {error}", line.trim()))?;
+    let expected_target = expected_target.to_string();
+    if trap.get("kind").and_then(serde_json::Value::as_str) != Some("network")
+        || trap.get("state").and_then(serde_json::Value::as_str) != Some("query")
+        || trap.get("syscall").and_then(serde_json::Value::as_str) != Some("sendmmsg")
+        || trap.get("target").and_then(serde_json::Value::as_str) != Some(expected_target.as_str())
+    {
+        return Err(format!("unexpected sendmmsg query: {}", line.trim()));
+    }
+    trap.get("query_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("sendmmsg query lacks query_id: {}", line.trim()))
+}
+
+#[cfg(target_os = "linux")]
+fn allow_query(control: &mut std::os::unix::net::UnixStream, query_id: &str) -> Result<(), String> {
+    let response = serde_json::json!({"query_id": query_id, "action": "allow"});
+    writeln!(control, "{response}").map_err(|error| format!("approve query {query_id}: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn receive_udp_payload(receiver: &UdpSocket, expected: &[u8], name: &str) -> Result<(), String> {
+    let mut payload = [0_u8; 32];
+    let (length, _) = receiver
+        .recv_from(&mut payload)
+        .map_err(|error| format!("receive sendmmsg target {name}: {error}"))?;
+    if payload[..length] == *expected {
+        Ok(())
+    } else {
+        Err(format!("sendmmsg target {name} received the wrong payload"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expect_no_udp_payload(receiver: &UdpSocket, name: &str) -> Result<(), String> {
+    receiver
+        .set_nonblocking(true)
+        .map_err(|error| format!("set sendmmsg target {name} nonblocking: {error}"))?;
+    let mut payload = [0_u8; 32];
+    let result = match receiver.recv_from(&mut payload) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Ok(_) => Err(format!(
+            "sendmmsg target {name} received a datagram before approval"
+        )),
+        Err(error) => Err(format!("read sendmmsg target {name}: {error}")),
+    };
+    receiver
+        .set_nonblocking(false)
+        .map_err(|error| format!("restore sendmmsg target {name} blocking mode: {error}"))?;
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_udp_sendmmsg_query(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+) -> Result<(), String> {
+    Err("interactive sendmmsg queries are linux-only".to_owned())
+}
+
+fn run_io_uring_denied(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+    let output = landstrip_net(ctx, format, policies)
+        .arg(exe)
+        .arg(IO_URING_PROBE_ARG)
+        .output()
+        .map_err(|error| format!("spawn io_uring probe: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "io_uring_setup was not denied; status={:?} output={}",
+            output.status,
+            merge(&output.stdout, &output.stderr).trim()
+        ))
     }
 }
 

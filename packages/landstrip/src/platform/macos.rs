@@ -313,10 +313,13 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
         )?;
     }
 
-    if network.allows_local_tcp_bind() {
+    if network.allows_local_binding() {
         sb.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
         sb.push_str("(allow network-bind (local tcp \"localhost:*\"))\n");
         sb.push_str("(allow network-inbound (local tcp \"localhost:*\"))\n");
+        sb.push_str("(allow network-outbound (remote udp \"localhost:*\"))\n");
+        sb.push_str("(allow network-bind (local udp \"localhost:*\"))\n");
+        sb.push_str("(allow network-inbound (local udp \"localhost:*\"))\n");
     }
 
     match network.unix_socket_access() {

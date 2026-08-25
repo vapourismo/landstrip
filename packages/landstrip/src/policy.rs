@@ -140,8 +140,8 @@ impl AccessPolicy {
 #[cfg(target_os = "windows")]
 impl AccessPolicy {
     /// Reject policies the Windows `AppContainer` cannot enforce: unrestricted
-    /// read, a local TCP bind, or a non-empty Unix socket allowlist. Connect
-    /// proxy ports are accepted but unenforceable, so the container then runs
+    /// read, selective local IP binding, or a non-empty Unix socket allowlist.
+    /// Connect proxy ports are accepted but unenforceable, so the container then runs
     /// with no network access.
     pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
         if matches!(self.read_access, ReadAccess::Unrestricted) {
@@ -153,7 +153,7 @@ impl AccessPolicy {
             return Ok(());
         }
 
-        if network.allows_local_tcp_bind() {
+        if network.allows_local_binding() {
             return Err(Error::PolicyTcpBindUnsupported);
         }
 
@@ -178,14 +178,14 @@ pub(crate) enum NetworkAccess {
     Unrestricted,
     Restricted {
         connect_tcp_ports: Vec<u16>,
-        bind: TcpBindAccess,
+        bind: IpBindAccess,
         unix_socket_access: UnixSocketAccess,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum TcpBindAccess {
+pub(crate) enum IpBindAccess {
     Deny,
     Localhost,
 }
@@ -213,11 +213,11 @@ impl NetworkAccess {
         }
     }
 
-    pub(crate) fn allows_local_tcp_bind(&self) -> bool {
+    pub(crate) fn allows_local_binding(&self) -> bool {
         matches!(
             self,
             Self::Restricted {
-                bind: TcpBindAccess::Localhost,
+                bind: IpBindAccess::Localhost,
                 ..
             }
         )
@@ -228,7 +228,7 @@ impl NetworkAccess {
         matches!(
             self,
             Self::Restricted {
-                bind: TcpBindAccess::Deny,
+                bind: IpBindAccess::Deny,
                 ..
             }
         )
@@ -247,7 +247,7 @@ impl NetworkAccess {
                 bind,
                 unix_socket_access,
                 ..
-            } => matches!(bind, TcpBindAccess::Localhost) || unix_socket_access.needs_broker(),
+            } => matches!(bind, IpBindAccess::Localhost) || unix_socket_access.needs_broker(),
         }
     }
 
@@ -260,7 +260,7 @@ impl NetworkAccess {
                 bind,
                 unix_socket_access,
             } => {
-                matches!(bind, TcpBindAccess::Localhost)
+                matches!(bind, IpBindAccess::Localhost)
                     || !connect_tcp_ports.is_empty()
                     || unix_socket_access.needs_broker()
             }
@@ -516,9 +516,9 @@ fn lower_network_policy(
     };
 
     let bind = if network.allow_local_binding {
-        TcpBindAccess::Localhost
+        IpBindAccess::Localhost
     } else {
-        TcpBindAccess::Deny
+        IpBindAccess::Deny
     };
     Ok(NetworkAccess::Restricted {
         connect_tcp_ports,

@@ -1,4 +1,4 @@
-.Dd August 25, 2026
+.Dd August 26, 2026
 .Dt LANDSTRIP 1
 .Os
 .Sh NAME
@@ -122,17 +122,45 @@ Linux and macOS enforce
 glob write denials at access time.
 Windows does not enforce write-denial globs.
 .Ss Network
-Direct TCP connections and new Unix sockets are denied by default.
+Direct TCP and UDP traffic and new Unix sockets are denied by default.
 Proxy port
-fields permit their loopback ports but do not start a proxy.
+fields permit TCP connections to their loopback ports but do not start a proxy;
+they do not grant UDP access.
+On Linux,
 .Va allowLocalBinding
-permits local TCP binding and loopback connections.
+restricts TCP and UDP binding and traffic to IPv4 and IPv6 loopback addresses.
+Wildcard and non-loopback binding and direct external traffic remain denied.
+On macOS, it uses Seatbelt's
+.Sq localhost
+endpoint filter for TCP and UDP.
+On some hosts, this filter can also match addresses assigned to other local
+interfaces.
+Enabling
+.Va allowLocalBinding
+on macOS may therefore permit a listener to bind to such an address and must
+not be relied on as a strict loopback-only security boundary.
+.Pp
+.Sy Linux warning :
+When
+.Va allowLocalBinding
+is enabled,
+.Sy io_uring_setup(2)
+fails with
+.Er EAFNOSUPPORT .
+This disables every io_uring operation, including filesystem I/O unrelated to
+networking.
+The restriction is required because the seccomp notification broker cannot
+inspect io_uring network operations, which could otherwise bypass selective UDP
+enforcement.
+Applications must use fallbacks that do not rely on io_uring while this policy
+is active.
+.Pp
 .Va allowUnixSockets
 permits listed pathname sockets.
 .Va allowNetwork
-turns off TCP enforcement while leaving filesystem policy active.
+turns off TCP and UDP enforcement while leaving filesystem policy active.
 .Pp
-Unix socket policy is unavailable on Windows.
+Unix socket policy and selective local binding are unavailable on Windows.
 Linux 6.12 and newer also restrict
 abstract sockets and signals to processes outside the sandbox.
 .Ss Windows
@@ -154,6 +182,15 @@ Landlock enforces filesystem roots and a seccomp broker handles network and
 query traps.
 .It macOS
 Seatbelt enforces a profile fixed at process startup.
+The
+.Va allowLocalBinding
+policy uses Seatbelt's
+.Sq localhost
+endpoint filter, which may include addresses on other local interfaces and is
+not a strict loopback-only boundary.
+See
+.Sx Network
+for details.
 .It Windows
 AppContainer or restricted local users enforce explicit filesystem grants.
 Restricted-user mode uses Windows Filtering Platform rules.
