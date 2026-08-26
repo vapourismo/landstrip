@@ -26,6 +26,7 @@ const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
 const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
 const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
 const UDP_PROBE_ARG: &str = "--test-udp";
+const ROUTE_SOCKET_PROBE_ARG: &str = "--test-route-socket";
 const IO_URING_PROBE_ARG: &str = "--test-io-uring";
 
 fn main() {
@@ -51,6 +52,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(UDP_PROBE_ARG) => {
             std::process::exit(udp_probe(args.next(), args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(ROUTE_SOCKET_PROBE_ARG) => {
+            std::process::exit(route_socket_probe());
         }
         Some(value) if value == std::ffi::OsStr::new(IO_URING_PROBE_ARG) => {
             std::process::exit(io_uring_probe());
@@ -213,6 +217,7 @@ enum Net {
     UdpSendmmsgDenied,
     UdpSendmmsgQuery,
     UdpSendmmsgWriteFault,
+    RouteSocketAllowed,
     IoUringDenied,
 }
 
@@ -616,6 +621,7 @@ fn parse_net(value: &str) -> Net {
         "udp-sendmmsg-denied" => Net::UdpSendmmsgDenied,
         "udp-sendmmsg-query" => Net::UdpSendmmsgQuery,
         "udp-sendmmsg-write-fault" => Net::UdpSendmmsgWriteFault,
+        "route-socket-allowed" => Net::RouteSocketAllowed,
         "io-uring-denied" => Net::IoUringDenied,
         other => panic!("unknown net kind `{other}`"),
     }
@@ -1059,6 +1065,23 @@ fn udp_sendmmsg(_argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
+#[cfg(target_os = "macos")]
+fn route_socket_probe() -> i32 {
+    // SAFETY: socket copies scalar arguments and returns a newly owned fd.
+    let fd = unsafe { libc::socket(libc::AF_ROUTE, libc::SOCK_RAW, 0) };
+    if fd < 0 {
+        return 1;
+    }
+    // SAFETY: socket returned a new descriptor whose ownership ends here.
+    unsafe { libc::close(fd) };
+    0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn route_socket_probe() -> i32 {
+    2
+}
+
 #[cfg(target_os = "linux")]
 fn udp_sendmmsg_write_fault(argument: Option<std::ffi::OsString>) -> std::io::Result<()> {
     use std::net::SocketAddr;
@@ -1348,7 +1371,24 @@ fn run_net(
         Net::UdpSendmmsgDenied => run_udp_sendmmsg_denied(ctx, format, policies),
         Net::UdpSendmmsgQuery => run_udp_sendmmsg_query(ctx, format, policies),
         Net::UdpSendmmsgWriteFault => run_udp_sendmmsg_write_fault(ctx, format, policies),
-        Net::IoUringDenied => run_io_uring_denied(ctx, format, policies),
+        Net::RouteSocketAllowed => run_self_probe(
+            ctx,
+            format,
+            policies,
+            ROUTE_SOCKET_PROBE_ARG,
+            None,
+            "spawn AF_ROUTE socket probe",
+            "AF_ROUTE socket creation failed",
+        ),
+        Net::IoUringDenied => run_self_probe(
+            ctx,
+            format,
+            policies,
+            IO_URING_PROBE_ARG,
+            None,
+            "spawn io_uring probe",
+            "io_uring_setup was not denied",
+        ),
     }
 }
 
@@ -1675,28 +1715,6 @@ fn run_udp_sendmmsg_query(
     Err("interactive sendmmsg queries are linux-only".to_owned())
 }
 
-fn run_io_uring_denied(
-    ctx: &Context,
-    format: PolicyFormat,
-    policies: &[PathBuf],
-) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
-    let output = landstrip_net(ctx, format, policies)
-        .arg(exe)
-        .arg(IO_URING_PROBE_ARG)
-        .output()
-        .map_err(|error| format!("spawn io_uring probe: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "io_uring_setup was not denied; status={:?} output={}",
-            output.status,
-            merge(&output.stdout, &output.stderr).trim()
-        ))
-    }
-}
-
 fn run_listener(
     ctx: &Context,
     format: PolicyFormat,
@@ -2017,15 +2035,14 @@ fn skip_old_landlock() -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn run_self_probe(
     ctx: &Context,
     format: PolicyFormat,
     policies: &[PathBuf],
     probe: &str,
     extra: Option<&std::ffi::OsStr>,
-    spawn_err: &str,
-    fail: &str,
+    spawn_label: &str,
+    failure_message: &str,
 ) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     let mut command = landstrip_net(ctx, format, policies);
@@ -2037,12 +2054,12 @@ fn run_self_probe(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("{spawn_err}: {e}"))?;
+        .map_err(|e| format!("{spawn_label}: {e}"))?;
     if output.status.code() == Some(0) {
         return Ok(());
     }
     Err(format!(
-        "{fail}; status={:?} output={}",
+        "{failure_message}; status={:?} output={}",
         output.status,
         merge(&output.stdout, &output.stderr).trim()
     ))

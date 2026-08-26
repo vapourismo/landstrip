@@ -62,6 +62,10 @@ name=yaml line policy permits configured root | os=linux,macos | format=yaml | p
 name=yaml line policy denies other root | os=linux,macos | format=yaml | policy=network:\n  allowNetwork: true\nfilesystem:\n  allowWrite: |\n    %TMP%/allowed\n  denyRead: |\n    /\n  allowRead: |\n    /\n | cmd=%SHELL% -c ': > "$1/yaml-nope.txt"' _ %TMP%/denied | status=!0
 name=stdin yaml policy runs tool | os=linux,macos | format=yaml | stdin_policy=true | policy=network:\n  allowNetwork: true\nfilesystem:\n  denyRead: |\n    /\n  allowRead: |\n    /\n | cmd=%SHELL% -c 'printf ok' | status=0
 
+# --- macOS routing sockets ---
+
+name=default network permits AF_ROUTE discovery socket | os=macos | policy={} | net=route-socket-allowed
+
 # --- TCP listeners ---
 
 name=default network denies TCP listener | os=linux,macos | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-denied
